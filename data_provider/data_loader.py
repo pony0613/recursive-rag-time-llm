@@ -72,6 +72,7 @@ class Dataset_ETT_hour(Dataset):
 
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        self.timestamps = df_stamp['date'].values  # Store timestamps
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -98,8 +99,11 @@ class Dataset_ETT_hour(Dataset):
         seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
+        
+        # Get the last timestamp from the sequence
+        last_timestamp = self.timestamps[s_end-1]
 
-        return seq_x, seq_y, seq_x_mark, seq_y_mark
+        return seq_x, seq_y, seq_x_mark, seq_y_mark, last_timestamp
 
     def __len__(self):
         return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in
@@ -169,6 +173,7 @@ class Dataset_ETT_minute(Dataset):
 
         df_stamp = df_raw[['date']][border1:border2]
         df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        self.timestamps = df_stamp['date'].values  # Store timestamps
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -196,8 +201,11 @@ class Dataset_ETT_minute(Dataset):
         seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
+        
+        # Get the last timestamp from the sequence
+        last_timestamp = self.timestamps[s_end-1]
 
-        return seq_x, seq_y, seq_x_mark, seq_y_mark
+        return seq_x, seq_y, seq_x_mark, seq_y_mark, last_timestamp
 
     def __len__(self):
         return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in
@@ -210,7 +218,7 @@ class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h', percent=100,
-                 seasonal_patterns=None, custom_features=None):
+                 seasonal_patterns=None):
         if size == None:
             self.seq_len = 24 * 4 * 4
             self.label_len = 24 * 4
@@ -230,7 +238,6 @@ class Dataset_Custom(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.percent = percent
-        self.custom_features = custom_features.split(',') if custom_features else None
 
         self.root_path = root_path
         self.data_path = data_path
@@ -238,43 +245,31 @@ class Dataset_Custom(Dataset):
 
         self.enc_in = self.data_x.shape[-1]
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
+        self._report()
+    def _report(self):
+        total = len(self.data_x) - self.seq_len - self.pred_len + 1
+        full_total = len(self.df_raw) - self.seq_len - self.pred_len + 1 if hasattr(self, 'df_raw') else 'N/A'
+        usage = total / full_total * 100 if isinstance(full_total, int) else 'N/A'
+        
+        print(f"[Dataset Info] Set type: {['train', 'val', 'test'][self.set_type]}")
+        print(f"[Dataset Info] Used sequence count: {total}")
+        print(f"[Dataset Info] Percent of full dataset: {usage if usage == 'N/A' else f'{usage:.2f}%'}")
+        print(f"[Dataset Info] From raw rows: {len(self.data_x)} | Target: {self.target}")
+        print(f"[Dataset Info] args.percent = {self.percent}%")
+
+
+
+        
 
     def __read_data__(self):
         self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
 
-        '''
-        df_raw.columns: ['timestamp' or 'date', ...(other features), target feature]
-        '''
         cols = list(df_raw.columns)
         cols.remove(self.target)
-        
-        # Check for timestamp or date column
-        time_col = None
-        if 'date' in cols:
-            time_col = 'date'
-            cols.remove('date')
-        elif 'timestamp' in cols:
-            time_col = 'timestamp'
-            cols.remove('timestamp')
-        else:
-            raise ValueError("Neither 'date' nor 'timestamp' column found in the dataset")
-            
-        # Handle NaN values
-        df_raw = df_raw.fillna(method='ffill').fillna(method='bfill')
-            
-        # Handle custom features option
-        if self.features == 'S_custom' and self.custom_features:
-            # Verify all custom features exist in columns
-            for feature in self.custom_features:
-                if feature not in cols and feature != self.target:
-                    raise ValueError(f"Custom feature '{feature}' not found in dataset columns")
-            
-            # Keep only the specified custom features
-            cols = [col for col in cols if col in self.custom_features]
-            
-        df_raw = df_raw[[time_col] + cols + [self.target]]
+        cols.remove('date')
+        df_raw = df_raw[['date'] + cols + [self.target]]
         num_train = int(len(df_raw) * 0.7)
         num_test = int(len(df_raw) * 0.2)
         num_vali = len(df_raw) - num_train - num_test
@@ -286,7 +281,7 @@ class Dataset_Custom(Dataset):
         if self.set_type == 0:
             border2 = (border2 - self.seq_len) * self.percent // 100 + self.seq_len
 
-        if self.features == 'M' or self.features == 'MS' or self.features == 'S_custom':
+        if self.features == 'M' or self.features == 'MS':
             cols_data = df_raw.columns[1:]
             df_data = df_raw[cols_data]
         elif self.features == 'S':
@@ -299,24 +294,9 @@ class Dataset_Custom(Dataset):
         else:
             data = df_data.values
 
-        # Handle timestamp processing
-        df_stamp = df_raw[[time_col]][border1:border2]
-        
-        # Convert timestamp to datetime if it's not already
-        try:
-            # Try to convert directly
-            df_stamp[time_col] = pd.to_datetime(df_stamp[time_col])
-        except:
-            # If timestamp is in unix format (seconds)
-            try:
-                df_stamp[time_col] = pd.to_datetime(df_stamp[time_col], unit='s')
-            except:
-                # If timestamp is in another format, use best guess
-                df_stamp[time_col] = pd.to_datetime(df_stamp[time_col], errors='coerce')
-                
-        # Rename to 'date' for consistency with the rest of the code
-        df_stamp = df_stamp.rename(columns={time_col: 'date'})
-            
+        df_stamp = df_raw[['date']][border1:border2]
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        self.timestamps = df_stamp['date'].values  # Store timestamps
         if self.timeenc == 0:
             df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
@@ -338,12 +318,16 @@ class Dataset_Custom(Dataset):
         s_end = s_begin + self.seq_len
         r_begin = s_end - self.label_len
         r_end = r_begin + self.label_len + self.pred_len
+
         seq_x = self.data_x[s_begin:s_end, feat_id:feat_id + 1]
         seq_y = self.data_y[r_begin:r_end, feat_id:feat_id + 1]
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
 
-        return seq_x, seq_y, seq_x_mark, seq_y_mark
+        # Get the last timestamp from the sequence
+        last_timestamp = self.timestamps[s_end-1]
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark, last_timestamp
 
     def __len__(self):
         return (len(self.data_x) - self.seq_len - self.pred_len + 1) * self.enc_in

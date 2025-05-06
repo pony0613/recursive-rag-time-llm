@@ -139,36 +139,36 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
     total_mae_loss = []
     model.eval()
     with torch.no_grad():
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(vali_loader)):
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, timestamps) in tqdm(enumerate(vali_loader)):
             batch_x = batch_x.float().to(accelerator.device)
-            batch_y = batch_y.float().to(accelerator.device)
+            batch_y = batch_y.float()
+
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
 
-            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(accelerator.device)
+            # decoder input
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(
+                accelerator.device)
 
+            # encoder - decoder
             if args.use_amp:
                 with torch.cuda.amp.autocast():
                     if args.output_attention:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamps)[0]
                     else:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamps)
             else:
                 if args.output_attention:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamps)[0]
                 else:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-            # Ensure outputs and batch_y are on the same device and are dense tensors
-            outputs = outputs.to(accelerator.device)
-            batch_y = batch_y.to(accelerator.device)
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamps)
 
             outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
 
             f_dim = -1 if args.features == 'MS' else 0
             outputs = outputs[:, -args.pred_len:, f_dim:]
-            batch_y = batch_y[:, -args.pred_len:, f_dim:]
+            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
 
             pred = outputs.detach()
             true = batch_y.detach()
@@ -181,9 +181,9 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
 
     total_loss = np.average(total_loss)
     total_mae_loss = np.average(total_mae_loss)
+
     model.train()
     return total_loss, total_mae_loss
-
 
 
 def test(args, accelerator, model, train_loader, vali_loader, criterion):
@@ -231,47 +231,3 @@ def load_content(args):
     with open('./dataset/prompt_bank/{0}.txt'.format(file), 'r') as f:
         content = f.read()
     return content
-
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-
-class NewsRetriever:
-    def __init__(self, model_name='all-MiniLM-L6-v2', embedding_dim=384):
-        # Load pre-trained SentenceTransformer model
-        self.model = SentenceTransformer(model_name)
-        self.embedding_dim = embedding_dim
-        self.index = faiss.IndexFlatL2(embedding_dim)
-        self.news_metadata = []  # To store metadata like date, title, etc.
-
-    def add_news(self, news_list):
-        """
-        Add news articles to the retriever.
-        :param news_list: List of dictionaries with 'content' and 'metadata'.
-        """
-        contents = [news['content'] for news in news_list]
-        embeddings = self.model.encode(contents, convert_to_numpy=True)
-        self.index.add(embeddings)
-        self.news_metadata.extend([news['metadata'] for news in news_list])
-
-    def search(self, query, top_k=5):
-        """
-        Search for the most relevant news articles.
-        :param query: Query string.
-        :param top_k: Number of top results to return.
-        :return: List of top-k news metadata.
-        """
-        query_embedding = self.model.encode([query], convert_to_numpy=True)
-        distances, indices = self.index.search(query_embedding, top_k)
-        results = [self.news_metadata[idx] for idx in indices[0]]
-        return results
-
-# Example usage
-# retriever = NewsRetriever()
-# news_data = [
-#     {"content": "Bitcoin price surges to new highs.", "metadata": {"date": "2023-12-13", "title": "Bitcoin News"}},
-#     {"content": "Ethereum network upgrade improves scalability.", "metadata": {"date": "2023-12-12", "title": "Ethereum Update"}}
-# ]
-# retriever.add_news(news_data)
-# query_result = retriever.search("Bitcoin price", top_k=1)
-# print(query_result)

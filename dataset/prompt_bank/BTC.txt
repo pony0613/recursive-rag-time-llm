@@ -1,1 +1,0 @@
-Historical data of Bitcoin (BTC) prices, including High, Low, Open, and Close (HLOC) values, for predicting future trends in cryptocurrency markets.

@@ -1,0 +1,20 @@
+python run_main.py \
+    --is_training 1 \
+    --root_path ./dataset/ \
+    --data_path electricity.csv \
+    --model_id TimeLLM_MS \
+    --model TimeLLM \
+    --data MS \
+    --features MS \
+    --seq_len 96 \
+    --label_len 48 \
+    --pred_len 96 \
+    --e_layers 2 \
+    --d_layers 1 \
+    --factor 3 \
+    --enc_in 7 \
+    --dec_in 7 \
+    --c_out 7 \
+    --des 'Exp' \
+    --itr 1 \
+    --train_epochs 10

@@ -166,8 +166,7 @@ class Model(nn.Module):
         if configs.prompt_domain:
             self.description = configs.content
         else:
-            self.description = 'The Electricity Transformer Temperature (ETT) is a crucial indicator in the electric power long-term deployment.'
-
+            self.description = 'The dataset is a CSV file that likely contains historical Bitcoin price data. The "H" in the filename might indicate that the data is organized on an hourly basis. The file may include columns such as date, open price, high price, low price, close price, and possibly trading volume or other related metrics.'
         self.dropout = nn.Dropout(configs.dropout)
 
         self.patch_embedding = PatchEmbedding(
@@ -177,7 +176,7 @@ class Model(nn.Module):
         self.vocab_size = self.word_embeddings.shape[0]
         self.num_tokens = 1000
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
-
+        
         self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
 
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
@@ -191,37 +190,13 @@ class Model(nn.Module):
 
         self.normalize_layers = Normalize(configs.enc_in, affine=False)
 
-    def generate_search_prompt(self, x_enc, x_mark_enc):
-        """
-        Generate a search prompt based on the input features.
-        :param x_enc: Encoded input features.
-        :param x_mark_enc: Encoded time features.
-        :return: A string representing the search prompt.
-        """
-        # Example: Use the mean and trend of the input features to generate a prompt
-        mean_value = torch.mean(x_enc, dim=1).item()
-        trend = torch.mean(x_enc[:, 1:] - x_enc[:, :-1], dim=1).item()
-
-        if trend > 0:
-            trend_description = "upward trend"
-        else:
-            trend_description = "downward trend"
-
-        prompt = (
-            f"Find news related to assets with a mean value of {mean_value:.2f} "
-            f"and an {trend_description}."
-        )
-
-        return prompt
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, timestamp=None):    
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            search_prompt = self.generate_search_prompt(x_enc, x_mark_enc)
-            return dec_out[:, -self.pred_len:, :], search_prompt
+            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, timestamp)
+            return dec_out[:, -self.pred_len:, :]
         return None
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, timestamp=None):
 
         x_enc = self.normalize_layers(x_enc, 'norm')
 
@@ -252,15 +227,16 @@ class Model(nn.Module):
             )
 
             prompt.append(prompt_)
-
+        
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
 
         prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
         prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
 
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
+
         x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc.float())
+        enc_out, n_vars = self.patch_embedding(x_enc)
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state

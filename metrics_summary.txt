@@ -1,0 +1,31 @@
+=== Model Evaluation Summary ===
+Time-LLM with and without RAG  
+Dataset: BTCPrice_H.csv  
+Target: close  
+Encoder Input Length: 96  
+Label Length: 24  
+LLM Model: GPT-2 (frozen)  
+Epochs: 5
+
+---------------------------------------------------------------------
+| Setting         | Train Loss | Test MSE | Test MAE  |
+---------------------------------------------------------------------
+| 96_24_24 (RAG)  | 0.07521    | 0.22915  | 0.13652   |
+| 96_24_48 (RAG)  | 0.08093    | 0.24747  | 0.14928   |
+| 96_24_96 (RAG)  | 0.08959    | 0.25194  | 0.16388   |
+| 96_24_24 (NoRAG)| 0.07516    | 0.23233  | 0.13794   |
+| 96_24_48 (NoRAG)| 0.08071    | 0.24568  | 0.14963   |
+| 96_24_96 (NoRAG)| 0.08931    | 0.25095  | 0.16322   |
+---------------------------------------------------------------------
+
+Notes:
+- MAE: Mean Absolute Error
+- MSE: Mean Squared Error (Test Loss)
+- Training Loss is averaged over batches from the final epoch.
+- Validation loss returned NaN due to occasional prediction failures on certain timestamps (likely caused by missing or empty retrieved news).
+- Learning rate was annealed to 2.5e-6 using cosine decay.
+- All runs used identical splits and architecture for fair comparison.
+
+Result Insight:
+- Training Loss increases with prediction horizon, as expected.
+- Slight advantage for RAG appears in short-term forecasting (96→24), but diminishes for longer horizons.

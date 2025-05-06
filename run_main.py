@@ -5,9 +5,8 @@ from accelerate import DistributedDataParallelKwargs
 from torch import nn, optim
 from torch.optim import lr_scheduler
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import numpy as np
-from models import Autoformer, DLinear, TimeLLM
+
+from models import Autoformer, DLinear, TimeLLM, TimeLLM_RAG
 
 from data_provider.data_factory import data_provider
 import time
@@ -17,33 +16,7 @@ import os
 
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
-os.environ["RANK"] = "0"
-os.environ["LOCAL_RANK"] = "0"
-os.environ["WORLD_SIZE"] = "1"
-os.environ["MASTER_ADDR"] = "localhost"
-os.environ["MASTER_PORT"] = "12355"
-def inverse_transform_single_feature(scaler, data, target_index=0):
-    """
-    安全地對單一變數做 inverse_transform，避免多欄 scaler 報錯。
-    支援 batch 預測資料 shape: (B, T, 1)
-    """
-    shape = data.shape
-    data = data.reshape(-1)  # 扁平化為 1D
 
-    # 從 scaler 取出對應特徵的 mean / std
-    mean = scaler.mean_[target_index]
-    std = scaler.scale_[target_index]
-
-    # 反標準化
-    data = (data * std) + mean
-
-    return data.reshape(shape)
-
-import deepspeed.comm.comm as ds_comm
-def fake_mpi_discovery(*args, **kwargs):
-    print("[INFO] Skipping mpi4py (patched)")
-    return
-ds_comm.mpi_discovery = fake_mpi_discovery
 from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
 
 parser = argparse.ArgumentParser(description='Time-LLM')
@@ -124,34 +97,31 @@ parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
-parser.add_argument('--custom_features', type=str, default=None, help='comma-separated list of custom features to use')
 
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
-accelerator = Accelerator()
-
-def plot_prediction(past, pred, true, title='BTC Forecast', save_path=None):
-
-            plt.figure(figsize=(12, 5))
-            plt.plot(np.arange(len(past)), past, label='Past Input (Observed)', color='blue')
-            plt.plot(np.arange(len(past), len(past) + len(true)), true, label='Ground Truth', color='green')
-            plt.plot(np.arange(len(past), len(past) + len(pred)), pred, label='Prediction', color='orange', linestyle='--')
-            plt.title(title)
-            plt.xlabel('Time (hours)')
-            plt.ylabel('Price')
-            plt.legend()
-            plt.grid(True)
-            if save_path:
-                plt.savefig(save_path)
-            else:
-                plt.show()
+accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=None)
 
 for ii in range(args.itr):
+    # setting record of experiments
     setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_{}_{}'.format(
-        args.task_name, args.model_id, args.model, args.data, args.features,
-        args.seq_len, args.label_len, args.pred_len, args.d_model, args.n_heads,
-        args.e_layers, args.d_layers, args.d_ff, args.factor, args.embed, args.des, ii)
+        args.task_name,
+        args.model_id,
+        args.model,
+        args.data,
+        args.features,
+        args.seq_len,
+        args.label_len,
+        args.pred_len,
+        args.d_model,
+        args.n_heads,
+        args.e_layers,
+        args.d_layers,
+        args.d_ff,
+        args.factor,
+        args.embed,
+        args.des, ii)
 
     train_data, train_loader = data_provider(args, 'train')
     vali_data, vali_loader = data_provider(args, 'val')
@@ -161,45 +131,37 @@ for ii in range(args.itr):
         model = Autoformer.Model(args).float()
     elif args.model == 'DLinear':
         model = DLinear.Model(args).float()
+    elif args.model == 'TimeLLM_RAG':
+        model = TimeLLM_RAG.Model(args).float()
     else:
         model = TimeLLM.Model(args).float()
 
-    path = os.path.join(args.checkpoints, setting + '-' + args.model_comment)
+    path = os.path.join(args.checkpoints,
+                        setting + '-' + args.model_comment)  # unique checkpoint saving path
     args.content = load_content(args)
     if not os.path.exists(path) and accelerator.is_local_main_process:
         os.makedirs(path)
 
-    checkpoint_file = os.path.join(path, 'checkpoint')
-    if args.is_training == 0:
-        if os.path.exists(checkpoint_file):
-            accelerator.print(f"[INFO] Loading model from checkpoint: {checkpoint_file}")
-            model.load_state_dict(torch.load(checkpoint_file, map_location=accelerator.device))
-        else:
-            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
-
-        model = accelerator.prepare(model)
-        criterion = nn.MSELoss()
-        mae_metric = nn.L1Loss()
-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
-        accelerator.print(f"[Inference] Test Loss: {test_loss:.4f}, MAE: {test_mae_loss:.4f}")
-        exit()
-
-    # Training mode from here on
     time_now = time.time()
+
     train_steps = len(train_loader)
     early_stopping = EarlyStopping(accelerator=accelerator, patience=args.patience)
-    trained_parameters = [p for p in model.parameters() if p.requires_grad]
+
+    trained_parameters = []
+    for p in model.parameters():
+        if p.requires_grad is True:
+            trained_parameters.append(p)
+
     model_optim = optim.Adam(trained_parameters, lr=args.learning_rate)
 
     if args.lradj == 'COS':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=20, eta_min=1e-8)
     else:
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=train_steps,
-            pct_start=args.pct_start,
-            epochs=args.train_epochs,
-            max_lr=args.learning_rate)
+        scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
+                                            steps_per_epoch=train_steps,
+                                            pct_start=args.pct_start,
+                                            epochs=args.train_epochs,
+                                            max_lr=args.learning_rate)
 
     criterion = nn.MSELoss()
     mae_metric = nn.L1Loss()
@@ -213,30 +175,35 @@ for ii in range(args.itr):
     for epoch in range(args.train_epochs):
         iter_count = 0
         train_loss = []
+
         model.train()
         epoch_time = time.time()
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader)):
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, timestamp) in tqdm(enumerate(train_loader)):
             iter_count += 1
             model_optim.zero_grad()
+
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float().to(accelerator.device)
             batch_x_mark = batch_x_mark.float().to(accelerator.device)
             batch_y_mark = batch_y_mark.float().to(accelerator.device)
+
+            # decoder input
             dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
             dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(accelerator.device)
 
+            # encoder - decoder
             if args.use_amp:
                 with torch.cuda.amp.autocast():
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    if isinstance(outputs, tuple): outputs = outputs[0]
-                    f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
+                    if args.output_attention:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamp)[0]
+                    else:
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamp)
             else:
-                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                if isinstance(outputs, tuple): outputs = outputs[0]
+                if args.output_attention:
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamp)[0]
+                else:
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark, timestamp=timestamp)
+
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -args.pred_len:, f_dim:]
@@ -244,10 +211,11 @@ for ii in range(args.itr):
                 train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:
-                accelerator.print(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
+                accelerator.print(
+                    "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                 speed = (time.time() - time_now) / iter_count
                 left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
-                accelerator.print(f"\tspeed: {speed:.4f}s/iter; left time: {left_time:.4f}s")
+                accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                 iter_count = 0
                 time_now = time.time()
 
@@ -267,56 +235,10 @@ for ii in range(args.itr):
         train_loss = np.average(train_loss)
         vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
         test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
-        accelerator.print(f"Epoch: {epoch + 1} | Train Loss: {train_loss:.7f} Vali Loss: {vali_loss:.7f} Test Loss: {test_loss:.7f} MAE Loss: {test_mae_loss:.7f}")
-        # 🔽 🔽 🔽 插入視覺化畫圖區塊 🔽 🔽 🔽
-        # =================== Visualization (after training epoch) ====================
-            # 即時畫圖
-        model.eval()
-        with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                if i > 0:
-                    break  # 只畫第一 batch
-                batch_x = batch_x.float().to(accelerator.device)
-                batch_y = batch_y.float().to(accelerator.device)
-                batch_x_mark = batch_x_mark.float().to(accelerator.device)
-                batch_y_mark = batch_y_mark.float().to(accelerator.device)
+        accelerator.print(
+            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
+                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
 
-                dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
-                dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(accelerator.device)
-
-                outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-
-                f_dim = -1 if args.features == 'MS' else 0
-                pred = outputs[:, -args.pred_len:, f_dim:].detach().cpu().numpy()
-                true = batch_y[:, -args.pred_len:, f_dim:].detach().cpu().numpy()
-                past = batch_x[:, :, f_dim:].detach().cpu().numpy()
-
-                # 反標準化
-                test_data = test_loader.dataset
-                pred_shape = pred.shape
-                true_shape = true.shape
-                past_shape = past.shape
-
-                pred = inverse_transform_single_feature(test_data.scaler, pred, target_index=0)
-                true = inverse_transform_single_feature(test_data.scaler, true, target_index=0)
-                past = inverse_transform_single_feature(test_data.scaler, past, target_index=0)
-
-
-                # 儲存成每個 epoch 專屬圖檔
-                save_name = f"forecast_result_epoch{epoch+1}.png"
-                plot_prediction(
-                    past=past[0].squeeze(),
-                    pred=pred[0].squeeze(),
-                    true=true[0].squeeze(),
-                    title=f"Epoch {epoch+1} Forecast: {args.seq_len}h → {args.pred_len}h",
-                    save_path=save_name
-                )
-                print(f"📊 Saved real-time forecast chart: {save_name}")
-                
-
-        # 🔼 🔼 🔼 結束畫圖區塊 🔼 🔼 🔼
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:
             accelerator.print("Early stopping")
@@ -333,124 +255,11 @@ for ii in range(args.itr):
                 adjust_learning_rate(accelerator, model_optim, scheduler, epoch + 1, args, printout=True)
         else:
             accelerator.print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
-                
 
-        
 
 
 accelerator.wait_for_everyone()
 if accelerator.is_local_main_process:
-    path = './checkpoints'
-    # del_files(path)  # optional clean-up
+    path = './checkpoints'  # unique checkpoint saving path
+    del_files(path)  # delete checkpoint files
     accelerator.print('success delete checkpoints')
-    # 🎬 合成訓練預測動畫
-
-if accelerator.is_local_main_process:
-    ...
-    accelerator.print('success delete checkpoints')
-
-# 🎯 產出長時段預測圖
-def generate_long_prediction_plot(model, test_loader, args, accelerator, save_path="long_forecast.png", max_points=10000):
-    import matplotlib.pyplot as plt
-    model.eval()
-    preds = []
-    trues = []
-    with torch.no_grad():
-        count = 0
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-            batch_x = batch_x.float().to(accelerator.device)
-            batch_y = batch_y.float().to(accelerator.device)
-            batch_x_mark = batch_x_mark.float().to(accelerator.device)
-            batch_y_mark = batch_y_mark.float().to(accelerator.device)
-
-            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float().to(accelerator.device)
-            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float()
-
-            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-            if isinstance(outputs, tuple): outputs = outputs[0]
-            f_dim = -1 if args.features == 'MS' else 0
-
-            pred = outputs[:, -args.pred_len:, f_dim:].detach().cpu().numpy()
-            true = batch_y[:, -args.pred_len:, f_dim:].detach().cpu().numpy()
-
-            preds.append(pred)
-            trues.append(true)
-
-            count += pred.shape[0] * pred.shape[1]
-            if count >= max_points:
-                break
-
-    preds = np.concatenate(preds, axis=0).reshape(-1)
-    trues = np.concatenate(trues, axis=0).reshape(-1)
-
-    # 反標準化
-    test_data = test_loader.dataset
-    preds = inverse_transform_single_feature(test_data.scaler, preds.reshape(-1, 1), target_index=0).reshape(-1)
-    trues = inverse_transform_single_feature(test_data.scaler, trues.reshape(-1, 1), target_index=0).reshape(-1)
-
-
-    # 畫圖
-    plt.figure(figsize=(20, 6))
-    plt.plot(trues, label="Ground Truth", color='green', linewidth=1)
-    plt.plot(preds, label="Prediction", color='orange', linestyle='--', linewidth=1)
-    plt.legend()
-    plt.title(f"📈 Long-term Forecast (first {len(preds)} hours)")
-    plt.xlabel("Time (hours)")
-    plt.ylabel("Price (USD)")
-    plt.grid(True)
-    plt.savefig(save_path)
-    print(f"✅ Saved long forecast plot to {save_path}")
-
-generate_long_prediction_plot(model, test_loader, args, accelerator, save_path="long_forecast.png", max_points=10000)
-
-import glob
-from PIL import Image
-
-image_files = sorted(
-    glob.glob("forecast_result_epoch*.png"),
-    key=lambda x: int(x.split("epoch")[1].split(".")[0])
-)
-
-if len(image_files) > 1:
-    images = [Image.open(img) for img in image_files]
-    images[0].save(
-        "training_forecast.gif",
-        save_all=True,
-        append_images=images[1:],
-        duration=1000,  # 每張圖顯示 1 秒
-        loop=0
-    )
-    accelerator.print("🎞️ Saved training animation as: training_forecast.gif")
-else:
-    accelerator.print("⚠️ Not enough forecast images to create animation.")
-
-import pandas as pd
-from utils.tools import NewsRetriever
-
-# Load news data from cryptonews.csv
-def load_news_data(news_file):
-    news_df = pd.read_csv(news_file)
-    news_list = []
-    for _, row in news_df.iterrows():
-        news_list.append({
-            "content": row["content"],
-            "metadata": {
-                "date": row["date"],
-                "title": row["title"],
-                "sentiment": row["sentiment"],
-                "source": row["source"],
-                "topic": row["topic"]
-            }
-        })
-    return news_list
-
-# Initialize NewsRetriever and add news data
-news_file = "cryptonews.csv"
-news_data = load_news_data(news_file)
-retriever = NewsRetriever()
-retriever.add_news(news_data)
-
-# Example query for testing
-query = "Bitcoin price prediction"
-retrieved_news = retriever.search(query, top_k=3)
-print("Retrieved News:", retrieved_news)
